@@ -1475,8 +1475,12 @@ task.spawn(function()
     while not _G.ZimiUnloaded do
         task.wait(3)
         for key, c in pairs(ESP_Cache) do
-            -- 检查 key 是否有效
-            if typeof(key) == "Instance" and not key.Parent then
+            -- 检查 key 是否有效 (Instance 被销毁)
+            local isValid = true
+            pcall(function()
+                if key.Parent then isValid = true else isValid = false end
+            end)
+            if not isValid then
                 HideAllESP(c)
                 for _, v in pairs(c) do
                     if type(v) == "userdata" and pcall(function() return v.Remove end) then
@@ -2000,66 +2004,80 @@ local function GetConfigList()
     return names
 end
 
--- 递归序列化：将 Color3/Enum/Vector3 等转为可 JSON 的纯表
+-- 判断是否为 Color3 类型
+local function IsColor3(val)
+    if type(val) ~= "userdata" then return false end
+    local ok = pcall(function() return val.R, val.G, val.B end)
+    return ok and val.R ~= nil
+end
+
+-- 判断是否为 Enum 类型
+local function IsEnum(val)
+    if type(val) ~= "userdata" then return false end
+    local ok = pcall(function() return val.Name, val.EnumType end)
+    return ok and val.Name ~= nil and val.EnumType ~= nil
+end
+
+-- 判断是否为 Vector3 类型
+local function IsVector3(val)
+    if type(val) ~= "userdata" then return false end
+    local ok = pcall(function() return val.X, val.Y, val.Z end)
+    return ok and val.X ~= nil
+end
+
+-- 递归序列化
 local function SerializeValue(val, depth)
     depth = depth or 0
     if depth > 20 then return nil end
+    local vt = type(val)
 
-    local t = type(val)
-    if t == "userdata" then
-        -- Color3
-        if typeof(val) == "Color3" then
-            return {__type = "Color3", R = val.R, G = val.G, B = val.B}
-        end
-        -- Vector3
-        if typeof(val) == "Vector3" then
-            return {__type = "Vector3", X = val.X, Y = val.Y, Z = val.Z}
-        end
-        -- Enum
-        pcall(function()
-            if val.EnumType then
-                return {__type = "Enum", Name = tostring(val)}
-            end
-        end)
-        -- 其他 userdata 跳过
-        return nil
-    elseif t == "table" then
+    if vt == "table" then
         local result = {}
         for k, v in pairs(val) do
             local sv = SerializeValue(v, depth + 1)
-            if sv ~= nil then
-                result[k] = sv
-            end
+            if sv ~= nil then result[k] = sv end
         end
         return result
-    elseif t == "number" or t == "string" or t == "boolean" then
+    elseif vt == "userdata" then
+        -- Color3
+        if IsColor3(val) then
+            return {__t = "c3", r = val.R, g = val.G, b = val.B}
+        end
+        -- Vector3
+        if IsVector3(val) then
+            return {__t = "v3", x = val.X, y = val.Y, z = val.Z}
+        end
+        -- Enum
+        if IsEnum(val) then
+            return {__t = "en", n = tostring(val)}
+        end
+        return nil
+    elseif vt == "number" or vt == "string" or vt == "boolean" then
         return val
     end
     return nil
 end
 
--- 递归反序列化：将纯表还原为 Color3/Enum/Vector3
+-- 递归反序列化
 local function DeserializeValue(val, depth)
     depth = depth or 0
     if depth > 20 then return nil end
-
     if type(val) ~= "table" then return val end
 
-    -- 检测特殊类型标记
-    if val.__type then
-        if val.__type == "Color3" and val.R ~= nil then
-            return Color3.fromRGB(val.R, val.G, val.B)
-        elseif val.__type == "Vector3" and val.X ~= nil then
-            return Vector3.new(val.X, val.Y, val.Z)
-        elseif val.__type == "Enum" and val.Name then
-            local ok, result = pcall(function()
-                return Enum[val.Name]
-            end)
-            if ok and result then return result end
-        end
+    -- 特殊类型还原
+    if val.__t == "c3" and val.r ~= nil then
+        return Color3.fromRGB(val.r, val.g, val.b)
+    end
+    if val.__t == "v3" and val.x ~= nil then
+        return Vector3.new(val.x, val.y, val.z)
+    end
+    if val.__t == "en" and val.n then
+        local ok, result = pcall(function()
+            return Enum[val.n]
+        end)
+        if ok and result then return result end
     end
 
-    -- 普通表递归还原
     local result = {}
     for k, v in pairs(val) do
         result[k] = DeserializeValue(v, depth + 1)
@@ -2067,18 +2085,13 @@ local function DeserializeValue(val, depth)
     return result
 end
 
--- 深度合并表（保留目标表中的默认字段）
+-- 深度合并表
 local function DeepMerge(target, source)
     for k, v in pairs(source) do
         if target[k] == nil then
             target[k] = v
-        elseif type(v) == "table" and type(target[k]) == "table" then
-            -- 检测是否是特殊序列化类型(有__type字段), 如果是则直接覆盖
-            if v.__type or target[k].__type then
-                target[k] = v
-            else
-                DeepMerge(target[k], v)
-            end
+        elseif type(v) == "table" and type(target[k]) == "table" and not v.__t and not target[k].__t then
+            DeepMerge(target[k], v)
         else
             target[k] = v
         end
@@ -2978,14 +2991,10 @@ table.insert(ZimiConnections, RunService.RenderStepped:Connect(function()
             end
         else
             for _, plr in ipairs(Players:GetPlayers()) do
-                if plr == LocalPlayer then continue end
-                if ZimiSettings.Hitbox.TeamCheck and plr.Team == LocalPlayer.Team then continue end
-                if ZimiSettings.Hitbox.FriendCheck then
-                    local isFriend = false
-                    pcall(function() isFriend = LocalPlayer:IsFriendsWith(plr.UserId) end)
-                    if isFriend then continue end
-                end
-                local char = plr.Character
+                if plr ~= LocalPlayer
+                   and not (ZimiSettings.Hitbox.TeamCheck and plr.Team == LocalPlayer.Team)
+                   and not (ZimiSettings.Hitbox.FriendCheck and pcall(function() return LocalPlayer:IsFriendsWith(plr.UserId) end)) then
+                    local char = plr.Character
                 if char then
                     local part = char:FindFirstChild(targetPartName)
                     if part and part:IsA("BasePart") then
@@ -3046,10 +3055,10 @@ table.insert(ZimiConnections, RunService.RenderStepped:Connect(function()
     -- ESP LOGIC
     if ZimiSettings.ESP.Master then
         for _, player in ipairs(Players:GetPlayers()) do
-            if player == LocalPlayer then continue end
+            if player ~= LocalPlayer then
             local e_char = player.Character
             
-            if not e_char or not e_char:FindFirstChild("HumanoidRootPart") then continue end
+            if e_char and e_char:FindFirstChild("HumanoidRootPart") then
             if not ESP_Cache[player] then CreateEspDrawings(player) end
             local c = ESP_Cache[player]
             
@@ -3067,10 +3076,7 @@ table.insert(ZimiConnections, RunService.RenderStepped:Connect(function()
             if not isAlive then shouldShowESP = false end
             if not head then shouldShowESP = false end
 
-            if not shouldShowESP or not onScreen or distToPlayer < 0 then 
-                HideAllESP(c)
-                continue 
-            end
+            if shouldShowESP and onScreen and distToPlayer >= 0 then
             
             local boxCol = ZimiSettings.ESP.Box.Color
             local trCol = ZimiSettings.ESP.Tracer.Color
@@ -3180,10 +3186,8 @@ table.insert(ZimiConnections, RunService.RenderStepped:Connect(function()
         if ZimiSettings.ESP.ShowNPCs then
             local targets = (ZimiSettings.ESP.EspNpcTarget and ZimiSettings.ESP.EspNpcTarget.Parent) and {ZimiSettings.ESP.EspNpcTarget} or ZimiSettings.NpcList
             for _, npcModel in ipairs(targets) do
-                if not npcModel or not npcModel.Parent then continue end
+                if npcModel and npcModel.Parent and npcModel:FindFirstChild("HumanoidRootPart") and npcModel:FindFirstChild("Head") then
                 local e_char = npcModel
-                if not e_char:FindFirstChild("HumanoidRootPart") then continue end
-                if not e_char:FindFirstChild("Head") then continue end
 
                 -- 为 NPC 创建 ESP 缓存 (使用 Model 本身作为 key)
                 if not ESP_Cache[npcModel] then CreateEspDrawings(npcModel) end
@@ -3197,20 +3201,9 @@ table.insert(ZimiConnections, RunService.RenderStepped:Connect(function()
                 local rootPos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
                 local distToPlayer = rootPos.Z
 
-                if not onScreen or distToPlayer < 0 then
-                    HideAllESP(c)
-                    continue
-                end
+                local showNpc = onScreen and distToPlayer >= 0 and isAlive and distToPlayer <= ZimiSettings.ESP.MaxDist
 
-                if not isAlive then
-                    HideAllESP(c)
-                    continue
-                end
-
-                if distToPlayer > ZimiSettings.ESP.MaxDist then
-                    HideAllESP(c)
-                    continue
-                end
+                if showNpc then
 
                 local boxCol = ZimiSettings.ESP.Box.Color
                 local trCol = ZimiSettings.ESP.Tracer.Color
@@ -3286,6 +3279,10 @@ table.insert(ZimiConnections, RunService.RenderStepped:Connect(function()
                 -- Health: 简化
                 c.HealthBar.Visible = false
                 c.HealthOutline.Visible = false
+                else
+                    HideAllESP(c)
+                end
+                end
             end
         end
     else
